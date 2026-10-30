@@ -1,0 +1,138 @@
+# Keeps the U2 radio watcher up with almost no gap until the schedule ends.
+#
+# Each watch job polls for 5h45m and then exits on its own, under the 6-hour
+# GitHub-hosted job limit, so the dedupe cache is saved before the runner is
+# killed. Cron fires hourly (minute 17, off the top-of-hour rush). Concurrency
+# group "u2-radio-watcher" allows one running job and one pending job; a newer
+# pending run replaces the older pending run, and the in-progress run is not
+# cancelled. The pending run starts as soon as the current one exits, so a
+# delayed cron does not open a long gap as long as one trigger landed during
+# the run. The handoff itself is only runner startup plus checkout.
+#
+# After 2026-11-05 (Europe/Amsterdam) the watch job checks the schedule and
+# exits without polling. workflow_dispatch modes:
+#   watch      long-running poller (also what cron does)
+#   probe      fetch every source once, send nothing
+#   test-push  one notification titled "Test: U2-melder draait op GitHub"
+#
+# NTFY_TOPIC is an Actions secret. It is never written to the repo.
+
+name: U2 radio watcher
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "watch, probe, or test-push"
+        required: true
+        type: choice
+        default: watch
+        options:
+          - watch
+          - probe
+          - test-push
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'probe')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure timezone data
+        run: |
+          python3 -c 'from zoneinfo import ZoneInfo; ZoneInfo("Europe/Amsterdam")' \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq tzdata; }
+
+      - name: Matcher self-test
+        run: python3 watcher.py --selftest
+
+      - name: Probe station sources
+        run: python3 watcher.py --probe
+
+  test-push:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'test-push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Send one labelled test push
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 watcher.py --test-push
+
+  watch:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'watch' || inputs.mode == ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    concurrency:
+      group: u2-radio-watcher
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure timezone data
+        run: |
+          python3 -c 'from zoneinfo import ZoneInfo; ZoneInfo("Europe/Amsterdam")' \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq tzdata; }
+
+      - name: Schedule still open
+        id: gate
+        run: |
+          set +e
+          python3 watcher.py --check-schedule
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" -eq 3 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "All schedule windows ended after 2026-11-05; doing nothing."
+          else
+            echo "schedule check failed ($code)" >&2
+            exit "$code"
+          fi
+
+      - name: Matcher self-test
+        if: steps.gate.outputs.run == 'true'
+        run: python3 watcher.py --selftest
+
+      - name: Restore dedupe state
+        id: restore-state
+        if: success() && steps.gate.outputs.run == 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: state.json
+          key: u2-watcher-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            u2-watcher-state-
+
+      - name: Ensure state file
+        if: success() && steps.gate.outputs.run == 'true'
+        run: |
+          if [ ! -f state.json ]; then
+            echo '{"alerted":{}}' > state.json
+          fi
+
+      - name: Run watcher
+        if: success() && steps.gate.outputs.run == 'true'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PYTHONUNBUFFERED: "1"
+        run: python3 watcher.py --duration 20700
+
+      - name: Save dedupe state
+        if: always() && steps.gate.outputs.run == 'true' && steps.restore-state.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: state.json
+          key: u2-watcher-state-${{ github.run_id }}-${{ github.run_attempt }}
