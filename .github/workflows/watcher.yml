@@ -19,14 +19,6 @@ name: U2 radio watcher
 on:
   schedule:
     - cron: "7,37 * * * *"
-  # A push of this file starts the watcher when workflow_dispatch is not
-  # available to the token that merges. The steady-state triggers are the
-  # cron above and workflow_dispatch; this push filter only matches edits
-  # to this file.
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/watcher.yml
   workflow_dispatch:
     inputs:
       mode:
@@ -79,7 +71,7 @@ jobs:
   watch:
     name: Watch
     # pull_request and mode=probe stay on the short job above.
-    if: github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'probe')
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'probe')
     runs-on: ubuntu-latest
     timeout-minutes: 348
     concurrency:
