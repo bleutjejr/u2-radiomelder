@@ -273,6 +273,10 @@ def poll(st, ignore_schedule=False):
                 cur = tracks[0]
                 st_ = dt.datetime.fromtimestamp(cur["start"], TZ).strftime("%d-%m %H:%M:%S") if cur.get("start") else "-"
                 logging.info("%-8s [%s] now/latest: %s - %s (start %s)", station, f.__name__, cur["artist"], cur["title"], st_)
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    # Annotations stay visible while a multi-hour job is still running.
+                    msg = f"{f.__name__}: {cur['artist']} - {cur['title']}".replace("\n", " ").replace("\r", " ")
+                    print(f"::notice title={station}::{msg}", flush=True)
             for t in tracks:
                 if is_u2(t["artist"]):
                     handle(station, t, st)
