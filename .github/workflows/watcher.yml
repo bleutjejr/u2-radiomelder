@@ -1,0 +1,208 @@
+# Keeps the U2 radio watcher running on GitHub-hosted runners.
+#
+# A job cannot run longer than 6 hours, so each watch runs for 330 minutes and
+# exits on its own. concurrency cancel-in-progress: false lets the next run
+# queue instead of cancelling the one that is on the air. Scheduled runs are
+# every 30 minutes, offset from the top of the hour because GitHub delays
+# crons that land on :00. While a watch is in progress, later crons replace
+# the single waiting run; when the active job exits, that waiter starts.
+# If a delayed cron left the queue empty, the job dispatches its successor
+# with GITHUB_TOKEN (workflow_dispatch is allowed to chain). Dedupe state is
+# passed through the Actions cache so a song that is still inside the 15
+# minute catch-up window is not alerted twice across the handoff.
+#
+# After the last schedule day (see SCHEDULE in watcher.py) the job exits
+# immediately and disables this workflow.
+
+name: U2 radio watcher
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "watch (run), probe (sources only), test (one labelled test push)"
+        type: choice
+        options:
+          - watch
+          - probe
+          - test
+        default: watch
+  pull_request:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  probe:
+    name: Probe sources
+    if: github.event_name == 'pull_request' || github.event.inputs.mode == 'probe'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    concurrency:
+      group: u2-radio-watcher-probe-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Matcher self-test
+        run: python3 watcher.py --selftest
+
+      - name: Runner location
+        run: |
+          python3 - << 'PY'
+          import json, urllib.request
+          try:
+              with urllib.request.urlopen("https://ipinfo.io/json", timeout=10) as r:
+                  d = json.load(r)
+              print("runner_country", d.get("country"), "region", d.get("region"), "org", d.get("org"))
+          except Exception as e:
+              print("ipinfo_failed", type(e).__name__)
+          PY
+
+      - name: Probe JOE and Radio 10
+        run: timeout 120 python3 -u watcher.py --probe
+
+  watch:
+    name: Watch
+    # pull_request and mode=probe stay on the short job above.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'probe')
+    runs-on: ubuntu-latest
+    timeout-minutes: 348
+    concurrency:
+      group: ${{ github.event.inputs.mode == 'test' && format('u2-radio-watcher-test-{0}', github.run_id) || 'u2-radio-watcher' }}
+      cancel-in-progress: false
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check schedule window
+        id: gate
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import datetime as dt
+          import os
+          import watcher
+          today = dt.datetime.now(watcher.TZ).date()
+          last = max(max(days) for days in watcher.SCHEDULE.values())
+          active = today <= last
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"active={'true' if active else 'false'}\n")
+              fh.write(f"today={today.isoformat()}\n")
+              fh.write(f"last={last.isoformat()}\n")
+          print(f"Europe/Amsterdam today={today} last_show_day={last} active={active}")
+          for station, days in watcher.SCHEDULE.items():
+              print(f"station {station} active_today={today in days}")
+          PY
+
+      - name: Turn the workflow off after the last show day
+        if: steps.gate.outputs.active != 'true' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          echo "Schedule ended after ${{ steps.gate.outputs.last }} (Europe/Amsterdam). Disabling this workflow."
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/disable"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "Could not disable the workflow. Later scheduled runs will exit immediately."
+          fi
+          exit 0
+
+      - name: Resolve mode
+        id: mode
+        if: steps.gate.outputs.active == 'true'
+        run: |
+          set -euo pipefail
+          mode="${{ github.event.inputs.mode }}"
+          if [ -z "$mode" ]; then mode=watch; fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode"
+
+      - name: Require NTFY_TOPIC
+        if: steps.mode.outputs.mode == 'watch' || steps.mode.outputs.mode == 'test'
+        run: |
+          set -euo pipefail
+          if [ -z "${NTFY_TOPIC}" ]; then
+            echo "NTFY_TOPIC repository secret is missing or not available to this run."
+            exit 1
+          fi
+          echo "NTFY_TOPIC secret is available."
+
+      - name: Matcher self-test
+        if: steps.gate.outputs.active == 'true'
+        run: python3 watcher.py --selftest
+
+      - name: Restore dedupe state
+        if: steps.mode.outputs.mode == 'watch'
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: u2-watcher-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            u2-watcher-state-
+
+      - name: Show restored dedupe state
+        if: steps.mode.outputs.mode == 'watch'
+        run: |
+          if [ -f state.json ]; then
+            python3 -c 'import json; print("restored_dedupe_keys", len(json.load(open("state.json")).get("alerted", {})))'
+          else
+            echo "restored_dedupe_keys 0 (no cache yet)"
+          fi
+
+      - name: Probe sources before watching
+        if: steps.gate.outputs.active == 'true'
+        run: timeout 120 python3 -u watcher.py --probe || echo "probe reported a failure; the watcher will keep polling its fallbacks"
+
+      - name: Send one labelled test push
+        if: steps.mode.outputs.mode == 'test'
+        run: python3 -u watcher.py --test-push
+
+      # 330 minutes stays under the 6 hour job limit, with time left for
+      # checkout, the probe, and the cache upload.
+      - name: Watch
+        if: steps.mode.outputs.mode == 'watch'
+        run: python3 -u watcher.py --duration 19800
+
+      - name: Save dedupe state
+        if: always() && steps.mode.outputs.mode == 'watch' && hashFiles('state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: u2-watcher-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Queue the next run when cron has not already queued one
+        if: success() && steps.mode.outputs.mode == 'watch' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          waiting=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/runs?per_page=30" \
+            --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"' and (.status=="queued" or .status=="pending" or .status=="waiting" or .status=="requested"))] | length')
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] || [ -z "${waiting}" ]; then
+            echo "Could not list queued runs. Dispatching a successor anyway."
+            waiting=0
+          fi
+          echo "other_queued_or_pending=${waiting}"
+          if [ "${waiting}" -ge 1 ]; then
+            echo "A successor is already queued."
+            exit 0
+          fi
+          echo "No successor is queued. Dispatching the next watch with GITHUB_TOKEN."
+          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/dispatches" \
+              -f ref=main \
+              -f inputs[mode]=watch; then
+            echo "Dispatch failed. A later scheduled run will start the next watcher."
+          fi
