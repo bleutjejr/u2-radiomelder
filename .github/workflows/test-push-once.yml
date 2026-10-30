@@ -1,0 +1,22 @@
+# Sends the single labelled test notification, then this file is removed.
+name: One test push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/test-push-once.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Send the labelled test push
+        run: python3 -u watcher.py --test-push
