@@ -1,18 +1,22 @@
 # Keeps the U2 radio watcher running on GitHub-hosted runners.
 #
 # A job cannot run longer than 6 hours, so each watch runs for 330 minutes and
-# exits on its own. concurrency cancel-in-progress: false lets the next run
+# exits on its own. concurrency cancel-in-progress: false lets the next cron
 # queue instead of cancelling the one that is on the air. Scheduled runs are
 # every 30 minutes, offset from the top of the hour because GitHub delays
-# crons that land on :00. While a watch is in progress, later crons replace
-# the single waiting run; when the active job exits, that waiter starts.
-# If a delayed cron left the queue empty, the job dispatches its successor
-# with GITHUB_TOKEN (workflow_dispatch is allowed to chain). Dedupe state is
-# passed through the Actions cache so a song that is still inside the 15
-# minute catch-up window is not alerted twice across the handoff.
+# crons that land on :00.
 #
-# After the last schedule day (see SCHEDULE in watcher.py) the job exits
-# immediately and disables this workflow.
+# The gap that used to sit between jobs (the live handoff was 17s from the end
+# of one Watch step to the start of the next, then another few seconds before
+# the first poll) is closed by starting the successor 3 minutes early. That
+# run uses its own concurrency group, so it connects while this one is still
+# listening. Dedupe is the Actions cache, a snapshot passed into the successor,
+# and a git ref claimed before each push. Queued crons are cancelled when the
+# successor is dispatched; an in-progress watch is never cancelled.
+#
+# After the last schedule day (last_show_day() in watcher.py, 6 Nov 2026 while
+# Radio 10 is still on) the job exits immediately and disables this workflow.
+# JOE stops after 5 Nov; Radio 10 continues through 6 Nov.
 
 name: U2 radio watcher
 
@@ -29,6 +33,14 @@ on:
           - probe
           - test
         default: watch
+      predecessor:
+        description: "Run id of the watcher this run overlaps. Empty for cron and manual starts."
+        type: string
+        default: ""
+      seed_state:
+        description: "Base64 dedupe snapshot from the overlapping watcher. Not a secret."
+        type: string
+        default: ""
   pull_request:
 
 permissions:
@@ -71,11 +83,17 @@ jobs:
   watch:
     name: Watch
     # pull_request and mode=probe stay on the short job above.
+    # A successor carries predecessor and must be allowed to run beside the
+    # watcher it is replacing. Test pushes get their own group. Everything
+    # else shares one group so a cron cannot start a second listener.
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'probe')
     runs-on: ubuntu-latest
     timeout-minutes: 348
+    permissions:
+      contents: write
+      actions: write
     concurrency:
-      group: ${{ github.event.inputs.mode == 'test' && format('u2-radio-watcher-test-{0}', github.run_id) || 'u2-radio-watcher' }}
+      group: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test') && format('u2-radio-watcher-test-{0}', github.run_id) || (github.event_name == 'workflow_dispatch' && github.event.inputs.predecessor != '') && format('u2-radio-watcher-handoff-{0}', github.run_id) || 'u2-radio-watcher' }}
       cancel-in-progress: false
     env:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
@@ -93,7 +111,7 @@ jobs:
           import os
           import watcher
           today = dt.datetime.now(watcher.TZ).date()
-          last = max(max(days) for days in watcher.SCHEDULE.values())
+          last = watcher.last_show_day()
           active = today <= last
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"active={'true' if active else 'false'}\n")
@@ -142,8 +160,42 @@ jobs:
         if: steps.gate.outputs.active == 'true'
         run: python3 watcher.py --selftest
 
+      # A cron that starts while the successor is already on the air must exit
+      # without listening and without dispatching another copy. The overlapping
+      # run sets busy=false immediately; it is supposed to run beside the old one.
+      - name: Skip when another watcher is already listening
+        id: busy
+        if: steps.gate.outputs.active == 'true' && steps.mode.outputs.mode == 'watch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREDECESSOR: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.predecessor || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PREDECESSOR}" ]; then
+            echo "busy=false" >> "$GITHUB_OUTPUT"
+            echo "This run overlaps ${PREDECESSOR} and will listen beside it."
+            exit 0
+          fi
+          set +e
+          others=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/runs?per_page=30" \
+            --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"' and (.event=="schedule" or .event=="workflow_dispatch") and .head_branch=="main" and .status=="in_progress")] | length')
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ] || [ -z "${others}" ]; then
+            echo "Could not list runs. This job will watch."
+            echo "busy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "other_in_progress=${others}"
+          if [ "${others}" -ge 1 ]; then
+            echo "busy=true" >> "$GITHUB_OUTPUT"
+            echo "Another watcher is already in progress. Leaving it on the air."
+          else
+            echo "busy=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Restore dedupe state
-        if: steps.mode.outputs.mode == 'watch'
+        if: steps.mode.outputs.mode == 'watch' && steps.busy.outputs.busy != 'true'
         uses: actions/cache/restore@v4
         with:
           path: state.json
@@ -152,7 +204,7 @@ jobs:
             u2-watcher-state-
 
       - name: Show restored dedupe state
-        if: steps.mode.outputs.mode == 'watch'
+        if: steps.mode.outputs.mode == 'watch' && steps.busy.outputs.busy != 'true'
         run: |
           if [ -f state.json ]; then
             python3 -c 'import json; print("restored_dedupe_keys", len(json.load(open("state.json")).get("alerted", {})))'
@@ -160,49 +212,92 @@ jobs:
             echo "restored_dedupe_keys 0 (no cache yet)"
           fi
 
-      - name: Probe sources before watching
-        if: steps.gate.outputs.active == 'true'
-        run: timeout 120 python3 -u watcher.py --probe || echo "probe reported a failure; the watcher will keep polling its fallbacks"
-
       - name: Send one labelled test push
         if: steps.mode.outputs.mode == 'test'
         run: python3 -u watcher.py --test-push
 
       # 330 minutes stays under the 6 hour job limit, with time left for
-      # checkout, the probe, and the cache upload.
+      # checkout and the cache upload. Three minutes before exit the successor
+      # is dispatched so it is already connected when this process stops.
       - name: Watch
-        if: steps.mode.outputs.mode == 'watch'
-        run: python3 -u watcher.py --duration 19800
+        if: steps.mode.outputs.mode == 'watch' && steps.busy.outputs.busy != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          U2_SHARED_DEDUPE: "1"
+          SEED_STATE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.seed_state || '' }}
+        run: |
+          set -euo pipefail
+          duration=19800
+          lead=180
+
+          handoff() {
+            local snap queued id
+            snap=$(python3 -c 'import watcher; print(watcher.dedupe_snapshot(), end="")') || return 1
+            queued=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/runs?per_page=30" \
+              --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"' and (.event=="schedule" or .event=="workflow_dispatch") and .head_branch=="main" and (.status=="queued" or .status=="pending" or .status=="waiting" or .status=="requested")) | .id] | .[]') || return 1
+            jq -n --arg mode watch --arg pred "${GITHUB_RUN_ID}" --arg seed "$snap" \
+              '{ref:"main", inputs:{mode:$mode, predecessor:$pred, seed_state:$seed}}' \
+              | gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/dispatches" --input - \
+              || return 1
+            echo "Successor dispatched to overlap this run."
+            # Only queued runs that already existed. Never an in-progress watch.
+            if [ -n "${queued}" ]; then
+              while IFS= read -r id; do
+                [ -z "${id}" ] && continue
+                echo "Cancelling queued run ${id} so it does not start a second watcher."
+                gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/cancel" || true
+              done <<< "${queued}"
+            fi
+          }
+
+          python3 -u watcher.py --duration "$duration" --seed-state "${SEED_STATE:-}" &
+          pid=$!
+          start=$(date +%s)
+          deadline=$((start + duration - lead))
+          dispatched=0
+          while kill -0 "$pid" 2>/dev/null; do
+            now=$(date +%s)
+            if [ "$dispatched" -eq 0 ] && [ "$now" -ge "$deadline" ] && [ "${GITHUB_REF:-}" = "refs/heads/main" ]; then
+              dispatched=1
+              if ! handoff; then
+                echo "Early handoff failed. The final step will try again."
+              fi
+            fi
+            sleep 2
+          done
+          wait "$pid"
 
       - name: Save dedupe state
-        if: always() && steps.mode.outputs.mode == 'watch' && hashFiles('state.json') != ''
+        if: always() && steps.mode.outputs.mode == 'watch' && steps.busy.outputs.busy != 'true' && hashFiles('state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: state.json
           key: u2-watcher-state-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Queue the next run when cron has not already queued one
-        if: success() && steps.mode.outputs.mode == 'watch' && github.ref == 'refs/heads/main'
+      - name: Queue the next run when the successor is not already up
+        if: success() && steps.mode.outputs.mode == 'watch' && steps.busy.outputs.busy != 'true' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
-          waiting=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/runs?per_page=30" \
-            --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"' and (.status=="queued" or .status=="pending" or .status=="waiting" or .status=="requested"))] | length')
+          others=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/runs?per_page=30" \
+            --jq '[.workflow_runs[] | select(.id != '"${GITHUB_RUN_ID}"' and (.event=="schedule" or .event=="workflow_dispatch") and .head_branch=="main" and (.status=="queued" or .status=="pending" or .status=="waiting" or .status=="requested" or .status=="in_progress"))] | length')
           rc=$?
           set -e
-          if [ "$rc" -ne 0 ] || [ -z "${waiting}" ]; then
-            echo "Could not list queued runs. Dispatching a successor anyway."
-            waiting=0
+          if [ "$rc" -ne 0 ] || [ -z "${others}" ]; then
+            echo "Could not list runs. Dispatching a successor anyway."
+            others=0
           fi
-          echo "other_queued_or_pending=${waiting}"
-          if [ "${waiting}" -ge 1 ]; then
-            echo "A successor is already queued."
+          echo "other_active=${others}"
+          if [ "${others}" -ge 1 ]; then
+            echo "A successor is already queued or running."
             exit 0
           fi
-          echo "No successor is queued. Dispatching the next watch with GITHUB_TOKEN."
-          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/dispatches" \
-              -f ref=main \
-              -f inputs[mode]=watch; then
+          echo "No successor is up. Dispatching the next watch."
+          snap=$(python3 -c 'import watcher; print(watcher.dedupe_snapshot(), end="")')
+          if ! jq -n --arg mode watch --arg pred "${GITHUB_RUN_ID}" --arg seed "$snap" \
+              '{ref:"main", inputs:{mode:$mode, predecessor:$pred, seed_state:$seed}}' \
+              | gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/watcher.yml/dispatches" --input -; then
             echo "Dispatch failed. A later scheduled run will start the next watcher."
           fi
